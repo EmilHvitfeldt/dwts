@@ -17,6 +17,9 @@ P131 ("located in the administrative territorial entity") chain upwards:
 Ireland, Cuba and so on are recorded with a country only. The same is true
 for places whose administrative chain is too thin to identify a subdivision.
 
+A handful of celebrities have no P19 on Wikidata at all; those are covered
+by MANUAL_BIRTHPLACES below, read off the English Wikipedia article.
+
 Output: data/celebrity_birthplaces.parquet
 """
 
@@ -63,6 +66,55 @@ SUBDIVISION_ITEMS = {
 }
 
 MAX_P131_DEPTH = 6
+
+# Hand-entered places, keyed by article title, for the celebrities Wikidata
+# has no usable P19 for (mostly recent reality-TV contestants whose items are
+# stubs) and the one it has wrong. Each is sourced from the English Wikipedia
+# article, and a null field means the article does not say. Applied over the
+# Wikidata result, so a value appearing upstream later does not silently
+# disagree with what is recorded here; unused entries are reported on each
+# run so this list does not rot.
+MANUAL_BIRTHPLACES = {
+    # article title: (city, state, country, note)
+    "Brooks Nader": ("Baton Rouge", "Louisiana", "United States", "born and raised"),
+    "Charity Lawson": ("Columbus", "Georgia", "United States", "born and raised"),
+    "Christine Chiu": (None, None, "Taiwan", "article redirects to Bling Empire#Cast"),
+    "Cody Rigsby": (None, "California", "United States", "born in California, no city given"),
+    "Harry Jowsey": ("Yeppoon", "Queensland", "Australia", "infobox"),
+    "Jen Affleck": (None, None, "United States", "described as American, no birthplace given"),
+    "Jenn Tran": ("Hillsdale", "New Jersey", "United States", "infobox"),
+    "Matt James (television personality)": (
+        None, "North Carolina", "United States", "raised in Raleigh; birth city not given",
+    ),
+    "Whitney Leavitt": ("American Fork", "Utah", "United States", "infobox"),
+    # Wikidata gives Mudgee, New South Wales, which belongs to someone else;
+    # the rodeo cowboy who danced in season 8 was born in Phoenix.
+    "Ty Murray": ("Phoenix", "Arizona", "United States", "corrects a wrong Wikidata P19"),
+}
+
+
+def apply_manual(out: pl.DataFrame) -> pl.DataFrame:
+    """Overlay MANUAL_BIRTHPLACES onto the scraped table."""
+    unused = set(MANUAL_BIRTHPLACES) - set(out.get_column("article_title").to_list())
+    if unused:
+        print(f"\nnote: {len(unused)} manual entries matched no celebrity: {sorted(unused)}")
+
+    fields = {"birth_city": 0, "birth_state": 1, "birth_country": 2}
+    return out.with_columns(
+        pl.coalesce(
+            pl.col("article_title").replace_strict(
+                {k: v[i] for k, v in MANUAL_BIRTHPLACES.items()},
+                default=None,
+                return_dtype=pl.String,
+            ),
+            # a manual row with a null field means "unknown", not "fall back",
+            # so blank the scraped value for every celebrity in the table
+            pl.when(pl.col("article_title").is_in(list(MANUAL_BIRTHPLACES)))
+            .then(None)
+            .otherwise(pl.col(name)),
+        ).alias(name)
+        for name, i in fields.items()
+    )
 
 
 def entity_claims(qids: list[str], batch: int = 25) -> dict[str, dict]:
@@ -266,6 +318,7 @@ def main() -> None:
     if out.height == 0:
         raise SystemExit("no celebrities resolved; refusing to write an empty table")
 
+    out = apply_manual(out)
     out.write_parquet(OUT_PATH)
     found = out.get_column("birth_country").is_not_null().sum()
     print(f"\nwrote {out.height} celebrities to {OUT_PATH}")
