@@ -26,6 +26,24 @@ def fetch_soup(season: int) -> BeautifulSoup:
     return BeautifulSoup(resp.text, "lxml")
 
 
+BR_SENTINEL = ""
+
+
+def cell_text(cell) -> str:
+    """Normalised text of a single table cell.
+
+    get_text(strip=True) drops whitespace-only text nodes, so a plain "\\n"
+    placeholder for <br> would vanish; use a non-whitespace sentinel instead
+    and convert it back afterwards. Footnote markers like "[14]", "[ a ]"
+    are stripped.
+    """
+    for br in cell.find_all("br"):
+        br.replace_with(BR_SENTINEL)
+    text = cell.get_text(" ", strip=True)
+    text = re.sub(rf"\s*{BR_SENTINEL}\s*", "\n", text)
+    return re.sub(r"\s*\[\s*[^\]]{0,6}\s*\]", "", text).strip()
+
+
 def expand_table_rows(table) -> list[list[str]]:
     """Turn a wikitable into a grid of text cells, expanding rowspan/colspan.
 
@@ -57,16 +75,7 @@ def expand_table_rows(table) -> list[list[str]]:
 
         for cell in cells:
             col = place_pending(col)
-            # get_text(strip=True) drops whitespace-only text nodes, so a plain
-            # "\n" placeholder for <br> would vanish; use a non-whitespace
-            # sentinel instead and convert it back afterwards.
-            BR_SENTINEL = "\uE000"
-            for br in cell.find_all("br"):
-                br.replace_with(BR_SENTINEL)
-            text = cell.get_text(" ", strip=True)
-            text = re.sub(rf"\s*{BR_SENTINEL}\s*", "\n", text)
-            # strip footnote/citation markers like "[14]", "[ a ]", "[ i ]"
-            text = re.sub(r"\s*\[\s*[^\]]{0,6}\s*\]", "", text).strip()
+            text = cell_text(cell)
             colspan = int(cell.get("colspan", 1))
             rowspan = int(cell.get("rowspan", 1))
 
@@ -90,6 +99,55 @@ def expand_table_rows(table) -> list[list[str]]:
     # pad ragged rows
     width = max(len(r) for r in grid)
     grid = [r + [""] * (width - len(r)) for r in grid]
+    return grid
+
+
+def expand_table_cells(table) -> list[list]:
+    """Turn a wikitable into a grid of the actual bs4 cell objects, expanding
+    rowspan/colspan by repeating the spanning cell (not its text).
+
+    Used where the caller needs to inspect a cell itself (e.g. for a link)
+    rather than just its normalised text, so column position has to be
+    resolved by header name instead of by raw cell index.
+    """
+    rows = table.find_all("tr")
+    grid: list[list] = []
+    pending: dict[int, tuple] = {}  # col -> (cell, rows remaining)
+
+    for row in rows:
+        out_row: list = []
+        col = 0
+
+        def place_pending(col):
+            while col in pending:
+                cell, remaining = pending[col]
+                out_row.append(cell)
+                remaining -= 1
+                if remaining <= 0:
+                    del pending[col]
+                else:
+                    pending[col] = (cell, remaining)
+                col += 1
+            return col
+
+        col = place_pending(col)
+
+        for cell in row.find_all(["th", "td"]):
+            col = place_pending(col)
+            colspan = int(cell.get("colspan", 1))
+            rowspan = int(cell.get("rowspan", 1))
+            for i in range(colspan):
+                out_row.append(cell)
+                if rowspan > 1:
+                    pending[col + i] = (cell, rowspan - 1)
+            col += colspan
+            col = place_pending(col)
+
+        col = place_pending(col)
+        grid.append(out_row)
+
+    width = max(len(r) for r in grid)
+    grid = [r + [None] * (width - len(r)) for r in grid]
     return grid
 
 
