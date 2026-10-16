@@ -8,6 +8,7 @@ DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
 AIR_DATES_PATH = DATA_DIR / "air_dates.parquet"
 BIRTHDATES_PATH = DATA_DIR / "celebrity_birthdates.parquet"
+BIRTHPLACES_PATH = DATA_DIR / "celebrity_birthplaces.parquet"
 OUT_PATH = DATA_DIR / "dwts_all_seasons.parquet"
 
 
@@ -89,9 +90,38 @@ def attach_ages(combined: pl.DataFrame) -> pl.DataFrame:
     return joined
 
 
+def attach_birthplaces(combined: pl.DataFrame) -> pl.DataFrame:
+    """Add each celebrity's birth city, state and country.
+
+    `birth_state` is null wherever a state is not a meaningful unit (the UK,
+    Ireland, Cuba and so on), so a null there is not a gap in the data.
+    """
+    if not BIRTHPLACES_PATH.exists():
+        print(f"note: {BIRTHPLACES_PATH} not found; run scrape_birthplaces.py to add it")
+        return combined
+
+    birthplaces = pl.read_parquet(BIRTHPLACES_PATH).select(
+        "celebrity", "birth_city", "birth_state", "birth_country"
+    )
+    joined = combined.join(birthplaces, on="celebrity", how="left")
+
+    known = joined.filter(pl.col("celebrity").is_not_null())
+    missing = known.get_column("birth_country").null_count()
+    if missing:
+        names = (
+            known.filter(pl.col("birth_country").is_null())
+            .get_column("celebrity")
+            .unique()
+            .to_list()
+        )
+        print(f"note: {missing} rows have no birthplace ({len(names)} celebrities: {names})")
+
+    return joined
+
+
 if __name__ == "__main__":
     try:
-        combined = attach_ages(attach_air_dates(concat_seasons()))
+        combined = attach_birthplaces(attach_ages(attach_air_dates(concat_seasons())))
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     combined.write_parquet(OUT_PATH)
