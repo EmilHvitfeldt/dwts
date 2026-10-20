@@ -48,69 +48,175 @@ def parse_cast_table(soup: BeautifulSoup) -> pl.DataFrame:
     return df.select(keep)
 
 
-SCORE_RE = re.compile(r"^\s*(\d+)\s*\(([^)]*)\)\s*$")
+SCORE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*\(([^)]*)\)\s*$")
+
+NO_SCORE = {"total_score": None, "judge_scores": None}
+
+
+def parse_number(text: str) -> float | None:
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
 def parse_score_cell(cell: str) -> dict:
     """Parse a cell like '20 (7, 7, 6)' into total + individual judge scores."""
     cell = cell.strip()
     if not cell or cell.lower().startswith("no score"):
-        return {"total_score": None, "judge_scores": None}
+        return NO_SCORE
     m = SCORE_RE.match(cell)
     if not m:
-        return {"total_score": None, "judge_scores": None}
-    total = int(m.group(1))
-    judges = [j.strip() for j in m.group(2).split(",")]
-    judges = [int(j) for j in judges if j.strip().isdigit()]
-    return {"total_score": total, "judge_scores": judges}
+        return NO_SCORE
+    judges = [parse_number(j.strip()) for j in m.group(2).split(",")]
+    return {
+        "total_score": float(m.group(1)),
+        "judge_scores": [j for j in judges if j is not None],
+    }
+
+
+def week_tables(heading) -> list:
+    """All wikitables in the section that starts at a week heading."""
+    tables = []
+    for el in heading.find_all_next(["h2", "h3", "table"]):
+        if el.name in ("h2", "h3"):
+            break
+        if "wikitable" in (el.get("class") or []):
+            tables.append(el)
+    return tables
+
+
+def find_column(header: list[str], name: str) -> int | None:
+    return header.index(name) if name in header else None
+
+
+def parse_week_table(table) -> list[dict]:
+    """Parse one week table into rows of couple, dance, music, result and scores.
+
+    Score columns vary: usually one 'Scores' column of cells like '20 (7, 7, 6)',
+    but season 15 splits the judges into separate half-point columns under a
+    two-row header, and two weeks (seasons 10 and 11) score technique and
+    performance separately. A row is emitted per score, tagged with `score_type`
+    in those weeks.
+    """
+    grid = expand_table_rows(table)
+    header = [normalize_header(c) for c in grid[0]]
+    labels = [" ".join(h.lower().split()) for h in header]
+
+    split_header = (
+        len(grid) > 1 and grid[1][0] == grid[0][0] and labels.count("scores") > 1
+    )
+    body = grid[2:] if split_header else grid[1:]
+
+    couple_col = find_column(header, "Couple")
+    if couple_col is None:
+        return []
+    dance_col = next((i for i, h in enumerate(header) if h.startswith("Dance")), None)
+    music_col = find_column(header, "Music")
+    if music_col is None:
+        music_col = next((i for i, h in enumerate(labels) if "music" in h), None)
+    result_col = find_column(header, "Result")
+
+    # (column, score_type); "alternate" means technical then performance rows
+    score_cols = []
+    judge_cols = []
+    total_col = None
+    if split_header:
+        judge_cols = [i for i, h in enumerate(labels) if h == "scores"]
+        total_col = find_column(labels, "total")
+    else:
+        for i, h in enumerate(labels):
+            if "technical" in h and "performance" in h:
+                score_cols.append((i, "alternate"))
+            elif "technical" in h:
+                score_cols.append((i, "technical"))
+            elif "performance" in h:
+                score_cols.append((i, "performance"))
+            elif h == "scores":
+                score_cols.append((i, None))
+
+    def cell(row, col):
+        return row[col] if col is not None else None
+
+    rows = []
+    seen: dict[str, int] = {}
+    for row in body:
+        couple_cell = row[couple_col]
+        if not couple_cell:
+            continue
+        # group-dance rows list multiple couples in one cell, newline-joined;
+        # parenthesised lines like "( Season 4 winner )" are annotations
+        couples = [
+            c.strip()
+            for c in couple_cell.split("\n")
+            if c.strip() and not c.strip().startswith("(")
+        ]
+        if not couples:
+            continue
+
+        if split_header:
+            judges = [parse_number(row[i]) for i in judge_cols]
+            judges = [j for j in judges if j is not None]
+            total = parse_number(row[total_col])
+            # marathon bonus points are one spanned cell repeated across the
+            # judge columns, so they do not sum to the total
+            if not judges or sum(judges) != total:
+                judges = None
+            scores = [(None, {"total_score": total, "judge_scores": judges})]
+        elif score_cols:
+            scores = []
+            for col, kind in score_cols:
+                if kind == "alternate":
+                    kind = ("technical", "performance")[seen.get(couple_cell, 0) % 2]
+                    seen[couple_cell] = seen.get(couple_cell, 0) + 1
+                scores.append((kind, parse_score_cell(row[col])))
+        else:
+            scores = [(None, NO_SCORE)]
+
+        for score_type, info in scores:
+            for couple in couples:
+                rows.append(
+                    {
+                        "couple": couple,
+                        "dance": cell(row, dance_col),
+                        "music": cell(row, music_col),
+                        "total_score": info["total_score"],
+                        "judge_scores": info["judge_scores"],
+                        "score_type": score_type,
+                        "result": cell(row, result_col),
+                        "is_group_dance": len(couples) > 1,
+                    }
+                )
+    return rows
 
 
 def parse_weekly_score_tables(soup: BeautifulSoup, season: int) -> pl.DataFrame:
-    """Parse each 'Week N' section's table into a tidy long-format frame."""
+    """Parse every table in each 'Week N' section into a tidy long-format frame."""
     all_rows = []
 
-    week_headers = soup.select("h3")
-    for h in week_headers:
+    for h in soup.select("h3"):
         heading_text = h.get_text(" ", strip=True)
         m = re.match(r"Week\s+(\d+)", heading_text)
         if not m:
             continue
         week_num = int(m.group(1))
 
-        table = h.find_next("table", class_="wikitable")
-        if table is None:
-            continue
-
-        grid = expand_table_rows(table)
-        header, *body = grid
-        header = [normalize_header(c) for c in header]
-
-        for row in body:
-            rec = dict(zip(header, row))
-            couple_cell = rec.get("Couple", "")
-            if not couple_cell:
-                continue
-            # group-dance rows list multiple couples in one cell, newline-joined
-            couples = [c.strip() for c in couple_cell.split("\n") if c.strip()]
-            score_info = parse_score_cell(rec.get("Scores", ""))
-            is_group = len(couples) > 1
-            for couple in couples:
+        for table in week_tables(h):
+            for rec in parse_week_table(table):
                 all_rows.append(
                     {
                         "season": season,
                         "week": week_num,
                         "week_label": heading_text,
-                        "couple": couple,
-                        "dance": rec.get("Dance"),
-                        "music": rec.get("Music"),
-                        "total_score": score_info["total_score"],
-                        "judge_scores": score_info["judge_scores"],
-                        "result": rec.get("Result"),
-                        "is_group_dance": is_group,
+                        **rec,
                     }
                 )
 
-    return pl.DataFrame(all_rows)
+    return pl.DataFrame(all_rows).with_columns(
+        pl.col("total_score").cast(pl.Float64),
+        pl.col("judge_scores").cast(pl.List(pl.Float64)),
+        pl.col("score_type").cast(pl.String),
+    )
 
 
 def match_couple_to_cast(couple: str, cast_rows: list[dict]) -> dict | None:
