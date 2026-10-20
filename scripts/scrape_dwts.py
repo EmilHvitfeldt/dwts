@@ -75,14 +75,78 @@ def parse_score_cell(cell: str) -> dict:
     }
 
 
-def week_tables(heading) -> list:
-    """All wikitables in the section that starts at a week heading."""
+# Season 15 labels its judge columns by surname instead of stating the order
+JUDGE_SURNAMES = {
+    "Inaba": "Carrie Ann Inaba",
+    "Goodman": "Len Goodman",
+    "Tonioli": "Bruno Tonioli",
+    "Abdul": "Paula Abdul",
+}
+
+JudgeOrder = list[tuple[str, bool]]
+
+
+def parse_judge_order(text: str) -> JudgeOrder:
+    """Parse '... left to right: A, B (Night 1 only), C.' into (name, optional) pairs.
+
+    `optional` marks a judge annotated in parentheses, who did not score every
+    dance in the section.
+    """
+    names = text.split(":", 1)[1]
+    names = re.sub(r"\s*\[\s*[^\]]{0,6}\s*\]", "", names)
+    order = []
+    for part in re.split(r",\s*(?:and\s+)?|\s+and\s+", names):
+        part = part.strip(" .")
+        if part:
+            order.append((re.sub(r"\s*\(.*?\)", "", part).strip(), "(" in part))
+    return order
+
+
+def is_judge_order(el) -> bool:
+    if el.name != "p":
+        return False
+    text = el.get_text(" ", strip=True)
+    return "left to right" in text and ":" in text
+
+
+def find_season_judge_order(soup: BeautifulSoup) -> JudgeOrder | None:
+    """The judge order stated above the first week, which applies unless overridden."""
+    for el in soup.find_all(["h3", "p"]):
+        if el.name == "h3" and re.match(r"Week\s+\d+", el.get_text(" ", strip=True)):
+            return None
+        if is_judge_order(el):
+            return parse_judge_order(el.get_text(" ", strip=True))
+    return None
+
+
+def resolve_judges(order: JudgeOrder | None, n_scores: int) -> list[str] | None:
+    """Names for `n_scores` scores, or None when the stated order does not fit."""
+    if not order:
+        return None
+    names = [name for name, _ in order]
+    if len(names) == n_scores:
+        return names
+    required = [name for name, optional in order if not optional]
+    if len(required) == n_scores:
+        return required
+    return None
+
+
+def week_tables(heading, season_order: JudgeOrder | None) -> list:
+    """(table, judge order) for each wikitable in the section at a week heading.
+
+    A week can restate the judge order (guest judges), which then applies to the
+    tables that follow it; otherwise the season-level order applies.
+    """
     tables = []
-    for el in heading.find_all_next(["h2", "h3", "table"]):
+    order = None
+    for el in heading.find_all_next(["h2", "h3", "p", "table"]):
         if el.name in ("h2", "h3"):
             break
-        if "wikitable" in (el.get("class") or []):
-            tables.append(el)
+        if is_judge_order(el):
+            order = parse_judge_order(el.get_text(" ", strip=True))
+        elif "wikitable" in (el.get("class") or []):
+            tables.append((el, order or season_order))
     return tables
 
 
@@ -90,7 +154,7 @@ def find_column(header: list[str], name: str) -> int | None:
     return header.index(name) if name in header else None
 
 
-def parse_week_table(table) -> list[dict]:
+def parse_week_table(table, order: JudgeOrder | None = None) -> list[dict]:
     """Parse one week table into rows of couple, dance, music, result and scores.
 
     Score columns vary: usually one 'Scores' column of cells like '20 (7, 7, 6)',
@@ -98,6 +162,9 @@ def parse_week_table(table) -> list[dict]:
     two-row header, and two weeks (seasons 10 and 11) score technique and
     performance separately. A row is emitted per score, tagged with `score_type`
     in those weeks.
+
+    `order` is the judge order stated for the table; it names the scores in
+    `judges` (season 15 names them from its column headers instead).
     """
     grid = expand_table_rows(table)
     header = [normalize_header(c) for c in grid[0]]
@@ -121,8 +188,10 @@ def parse_week_table(table) -> list[dict]:
     score_cols = []
     judge_cols = []
     total_col = None
+    judge_names = []
     if split_header:
         judge_cols = [i for i, h in enumerate(labels) if h == "scores"]
+        judge_names = [JUDGE_SURNAMES.get(grid[1][i], grid[1][i]) for i in judge_cols]
         total_col = find_column(labels, "total")
     else:
         for i, h in enumerate(labels):
@@ -155,23 +224,37 @@ def parse_week_table(table) -> list[dict]:
             continue
 
         if split_header:
-            judges = [parse_number(row[i]) for i in judge_cols]
-            judges = [j for j in judges if j is not None]
+            pairs = [
+                (name, parse_number(row[i])) for name, i in zip(judge_names, judge_cols)
+            ]
+            pairs = [(name, score) for name, score in pairs if score is not None]
             total = parse_number(row[total_col])
             # marathon bonus points are one spanned cell repeated across the
             # judge columns, so they do not sum to the total
-            if not judges or sum(judges) != total:
-                judges = None
-            scores = [(None, {"total_score": total, "judge_scores": judges})]
+            if not pairs or sum(score for _, score in pairs) != total:
+                pairs = []
+            scores = [
+                (
+                    None,
+                    {
+                        "total_score": total,
+                        "judge_scores": [score for _, score in pairs] or None,
+                        "judges": [name for name, _ in pairs] or None,
+                    },
+                )
+            ]
         elif score_cols:
             scores = []
             for col, kind in score_cols:
                 if kind == "alternate":
                     kind = ("technical", "performance")[seen.get(couple_cell, 0) % 2]
                     seen[couple_cell] = seen.get(couple_cell, 0) + 1
-                scores.append((kind, parse_score_cell(row[col])))
+                info = parse_score_cell(row[col])
+                judge_scores = info["judge_scores"]
+                judges = resolve_judges(order, len(judge_scores)) if judge_scores else None
+                scores.append((kind, {**info, "judges": judges}))
         else:
-            scores = [(None, NO_SCORE)]
+            scores = [(None, {**NO_SCORE, "judges": None})]
 
         for score_type, info in scores:
             for couple in couples:
@@ -182,6 +265,7 @@ def parse_week_table(table) -> list[dict]:
                         "music": cell(row, music_col),
                         "total_score": info["total_score"],
                         "judge_scores": info["judge_scores"],
+                        "judges": info["judges"],
                         "score_type": score_type,
                         "result": cell(row, result_col),
                         "is_group_dance": len(couples) > 1,
@@ -193,6 +277,7 @@ def parse_week_table(table) -> list[dict]:
 def parse_weekly_score_tables(soup: BeautifulSoup, season: int) -> pl.DataFrame:
     """Parse every table in each 'Week N' section into a tidy long-format frame."""
     all_rows = []
+    season_order = find_season_judge_order(soup)
 
     for h in soup.select("h3"):
         heading_text = h.get_text(" ", strip=True)
@@ -201,22 +286,35 @@ def parse_weekly_score_tables(soup: BeautifulSoup, season: int) -> pl.DataFrame:
             continue
         week_num = int(m.group(1))
 
-        for table in week_tables(h):
-            for rec in parse_week_table(table):
+        # unique within a week, so (season, week, performance_order) is a key
+        performance_order = 0
+        for table, order in week_tables(h, season_order):
+            for rec in parse_week_table(table, order):
+                performance_order += 1
                 all_rows.append(
                     {
                         "season": season,
                         "week": week_num,
                         "week_label": heading_text,
+                        "performance_order": performance_order,
                         **rec,
                     }
                 )
 
-    return pl.DataFrame(all_rows).with_columns(
+    df = pl.DataFrame(all_rows).with_columns(
         pl.col("total_score").cast(pl.Float64),
         pl.col("judge_scores").cast(pl.List(pl.Float64)),
+        pl.col("judges").cast(pl.List(pl.String)),
         pl.col("score_type").cast(pl.String),
     )
+
+    unnamed = df.filter(
+        pl.col("judge_scores").is_not_null() & pl.col("judges").is_null()
+    )
+    if unnamed.height:
+        weeks = sorted(unnamed.get_column("week").unique().to_list())
+        print(f"  warning: {unnamed.height} scored row(s) without judge names (weeks {weeks})")
+    return df
 
 
 def match_couple_to_cast(couple: str, cast_rows: list[dict]) -> dict | None:
