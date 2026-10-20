@@ -10,6 +10,8 @@ AIR_DATES_PATH = DATA_DIR / "air_dates.parquet"
 BIRTHDATES_PATH = DATA_DIR / "celebrity_birthdates.parquet"
 BIRTHPLACES_PATH = DATA_DIR / "celebrity_birthplaces.parquet"
 OUT_PATH = DATA_DIR / "dwts_all_seasons.parquet"
+JUDGE_SCORES_PATH = DATA_DIR / "judge_scores.parquet"
+KEY = ["season", "week", "performance_order"]
 
 
 def concat_seasons(data_dir: Path = RAW_DIR) -> pl.DataFrame:
@@ -119,12 +121,52 @@ def attach_birthplaces(combined: pl.DataFrame) -> pl.DataFrame:
     return joined
 
 
+def validate_keys(combined: pl.DataFrame) -> None:
+    """(season, week, performance_order) must identify exactly one row."""
+    duplicated = combined.filter(
+        pl.struct(KEY).is_duplicated() | pl.col("performance_order").is_null()
+    )
+    if duplicated.height:
+        raise ValueError(
+            f"VALIDATION FAILED: {duplicated.height} rows lack a unique {KEY} key\n"
+            f"{duplicated.select(*KEY, 'couple', 'dance')}"
+        )
+
+
+def build_judge_scores_long(combined: pl.DataFrame) -> pl.DataFrame:
+    """One row per judge score, keyed back to the combined data by KEY.
+
+    Rows whose judges could not be named are left out, so a score never gets
+    attached to the wrong judge.
+    """
+    named = combined.filter(pl.col("judges").is_not_null())
+    mismatched = named.filter(
+        pl.col("judges").list.len() != pl.col("judge_scores").list.len()
+    )
+    if mismatched.height:
+        raise ValueError(
+            f"VALIDATION FAILED: {mismatched.height} rows have a different number "
+            f"of judges and judge scores\n"
+            f"{mismatched.select(*KEY, 'couple', 'judges', 'judge_scores')}"
+        )
+
+    return (
+        named.select(*KEY, "couple", "judges", "judge_scores")
+        .rename({"judges": "judge", "judge_scores": "score"})
+        .explode("judge", "score", empty_as_null=False)
+    )
+
+
 if __name__ == "__main__":
     try:
         combined = attach_birthplaces(attach_ages(attach_air_dates(concat_seasons())))
+        validate_keys(combined)
+        judge_scores = build_judge_scores_long(combined)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     combined.write_parquet(OUT_PATH)
+    judge_scores.write_parquet(JUDGE_SCORES_PATH)
     print(f"combined {combined.get_column('season').n_unique()} seasons")
     print(f"wrote {combined.height} rows to {OUT_PATH}")
+    print(f"wrote {judge_scores.height} judge scores to {JUDGE_SCORES_PATH}")
     print(combined)
