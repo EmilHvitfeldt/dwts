@@ -48,6 +48,7 @@ clean = (
         pl.col("dance").is_not_null(),
         pl.col("dance").str.contains(TEAM_DANCE_PATTERN).not_(),
         pl.col("total_score").is_not_null(),
+        pl.col("score_type").is_null(),  # technical/performance split weeks
         pl.col("n_judges").is_not_null(),
     )
     .with_columns((pl.col("total_score") / pl.col("n_judges")).alias("avg_judge_score"))
